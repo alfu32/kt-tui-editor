@@ -6,10 +6,12 @@ import org.treesitter.TSParser
 import org.treesitter.TSPoint
 import org.treesitter.TSInputEdit
 import org.treesitter.TSTree
+import java.nio.charset.StandardCharsets
 
-class TreeSitterNode(
+internal class TreeSitterNode(
     private val node: TSNode,
     private val source: String,
+    private val offsets: Utf8SourceOffsets,
     private val parentNode: TreeSitterNode? = null,
     private val field: String? = null
 ) : TsNode {
@@ -17,19 +19,24 @@ class TreeSitterNode(
         get() = node.type
 
     override val text: String
-        get() = safeSubstring(node.startByte, node.endByte)
+        get() = safeSubstring(startByte, endByte)
 
+    /**
+     * Tree-sitter itself uses UTF-8 byte positions. The editor and semantic
+     * model use Kotlin String (UTF-16) offsets, so expose normalized offsets
+     * through the language-neutral node contract.
+     */
     override val startByte: Int
-        get() = node.startByte
+        get() = offsets.characterOffset(node.startByte)
 
     override val endByte: Int
-        get() = node.endByte
+        get() = offsets.characterOffset(node.endByte)
 
     override val startPoint: Point
-        get() = node.startPoint.toPoint()
+        get() = pointAt(startByte, node.startPoint.row)
 
     override val endPoint: Point
-        get() = node.endPoint.toPoint()
+        get() = pointAt(endByte, node.endPoint.row)
 
     override fun parent(): TsNode? = parentNode
 
@@ -41,7 +48,7 @@ class TreeSitterNode(
             val child = node.getNamedChild(i)
             if (child == null || child.isNull) continue
             val fieldName = node.getFieldNameForNamedChild(i)
-            list.add(TreeSitterNode(child, source, this, fieldName))
+            list.add(TreeSitterNode(child, source, offsets, this, fieldName))
         }
         return list
     }
@@ -54,7 +61,7 @@ class TreeSitterNode(
             val child = node.getChild(i)
             if (child == null || child.isNull) continue
             val fieldName = node.getFieldNameForChild(i)
-            list.add(TreeSitterNode(child, source, this, fieldName))
+            list.add(TreeSitterNode(child, source, offsets, this, fieldName))
         }
         return list
     }
@@ -64,6 +71,11 @@ class TreeSitterNode(
     private fun safeSubstring(start: Int, end: Int): String {
         if (start < 0 || end <= start || end > source.length) return ""
         return source.substring(start, end)
+    }
+
+    private fun pointAt(offset: Int, row: Int): Point {
+        val lineStart = source.lastIndexOf('\n', offset - 1).let { if (it < 0) 0 else it + 1 }
+        return Point(row, offset - lineStart)
     }
 }
 
@@ -93,7 +105,32 @@ class TreeSitterParsedTree internal constructor(
     internal val tree: TSTree,
     private val source: String
 ) {
-    internal fun rootNode(): TsNode = TreeSitterNode(tree.rootNode, source)
+    private val offsets = Utf8SourceOffsets(source)
+
+    internal fun rootNode(): TsNode = TreeSitterNode(tree.rootNode, source, offsets)
+}
+
+/** Maps Tree-sitter UTF-8 byte boundaries to Kotlin String offsets. */
+internal class Utf8SourceOffsets(source: String) {
+    private val byteToCharacter = IntArray(source.toByteArray(StandardCharsets.UTF_8).size + 1)
+
+    init {
+        var character = 0
+        var byte = 0
+        byteToCharacter[0] = 0
+        while (character < source.length) {
+            val codePoint = source.codePointAt(character)
+            val characterCount = Character.charCount(codePoint)
+            val byteCount = String(Character.toChars(codePoint)).toByteArray(StandardCharsets.UTF_8).size
+            repeat(byteCount) { index -> byteToCharacter[byte + index] = character }
+            byte += byteCount
+            character += characterCount
+            byteToCharacter[byte] = character
+        }
+    }
+
+    fun characterOffset(byteOffset: Int): Int =
+        byteToCharacter[byteOffset.coerceIn(0, byteToCharacter.lastIndex)]
 }
 
 object TreeSitterLinearizer {
@@ -120,5 +157,3 @@ class TreeSitterIdentifierPipeline(
         return IdentifierCollector().collect(linear, adapter, fileName, language)
     }
 }
-
-private fun TSPoint.toPoint(): Point = Point(row, column)

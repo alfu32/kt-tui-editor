@@ -107,6 +107,28 @@ class SemanticHighlightingTest {
     }
 
     @Test
+    fun normalizesTreeSitterUtf8RangesBeforeRenderingSemanticTokens() {
+        val service = CodeIntelService(debounceMs = 0L)
+        try {
+            // Tree-sitter reports byte offsets. These Unicode characters must
+            // not move semantic painting on the following source line.
+            val text = "// naïve — 😀\nclass Customer { val name: String = \"Ada\" }"
+            service.indexDocumentNow("Unicode.kt", "kotlin", text, version = 1L)
+            val lines = text.lines()
+            val tokens = service.tokens(TokensRequest("Unicode.kt", "kotlin", 0, lines, 1L))
+
+            tokens.forEach { token ->
+                assertEquals(token.text, lines[token.line].substring(token.start, token.end))
+            }
+            assertTrue(tokens.any { it.text == "class" && "semantic.keyword" in it.scopes })
+            assertTrue(tokens.any { it.text == "Customer" && "semantic.class" in it.scopes })
+            assertTrue(tokens.any { it.text == "name" && "semantic.property" in it.scopes })
+        } finally {
+            service.shutdown()
+        }
+    }
+
+    @Test
     fun reusesKotlinParserStateAcrossEditedDocumentVersions() {
         val adapter = KotlinSemanticAdapter()
         val first = adapter.extract(
