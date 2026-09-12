@@ -270,6 +270,19 @@ code-search-active {
     bg: #d8e6ff;
     fg: #13203c;
 }
+definition-title {
+    bg: #6b7280;
+    fg: #f1f3f5;
+    text-decoration: bold;
+}
+definition-delimiter {
+    bg: #6b7280;
+    fg: #d8dbe2;
+}
+code-popup-scrollbar {
+    bg: #25345a;
+    fg: #9fb7ff;
+}
 codeintel.usage {
     fg: #5da9ff;
     bg: #1a2237;

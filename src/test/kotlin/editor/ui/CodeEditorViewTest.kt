@@ -11,6 +11,16 @@ import editor.grammars.Token
 import react.StyleSet
 import react.renderer.StringSnapshotRenderer
 import editor.grammars.KeywordSyntaxProvider
+import editor.codeintel.EditorIntelligenceService
+import editor.codeintel.CompletionItem
+import editor.codeintel.DefinitionRequest
+import editor.codeintel.NavigationTarget
+import editor.codeintel.ReferenceRequest
+import editor.codeintel.TextPosition
+import editor.codeintel.TokensRequest
+import editor.codeintel.Diagnostic
+import editor.codeintel.Symbol
+import java.nio.file.Files
 
 class CodeEditorViewTest {
     @Test
@@ -204,6 +214,124 @@ class CodeEditorViewTest {
     }
 
     @Test
+    fun definitionPopupPagesTargetsAndNavigatesSelectedProjectRelativeFile() {
+        val root = Files.createTempDirectory("kode-definition-popup")
+        val first = root.resolve("first.c").also { Files.writeString(it, "int foo(void) { return 1; }\n") }
+        val second = root.resolve("second.c").also { Files.writeString(it, "int foo(void) { return 2; }\n") }
+        val opened = mutableListOf<String>()
+        val service = PopupIntelligence(
+            definitions = listOf(
+                NavigationTarget(first.toString(), range(0)),
+                NavigationTarget(second.toString(), range(0))
+            )
+        )
+        val view = CodeEditorView(
+            StyleSheet(),
+            syntaxProvider = KeywordSyntaxProvider,
+            codeIntel = service,
+            navigationHandler = { path, _ -> opened += path },
+            projectRootProvider = { root }
+        )
+        view.loadVirtualContent(root.resolve("current.c").toString(), "foo\n", "c")
+        val renderer = StringSnapshotRenderer(cols = 80, rows = 20)
+        view.render(renderer)
+        view.dispatch(UIEvent(kind = "mouse_move", x = 3, y = 1, timeMs = 0, cols = 80, rows = 20))
+        view.dispatch(UIEvent(kind = "mouse_move", x = 3, y = 1, timeMs = 600, cols = 80, rows = 20))
+        view.render(renderer)
+        assertTrue(renderer.snapshot().lines().any { it.contains("Definition") })
+        assertTrue(renderer.snapshot().lines().any { it.contains("first.c:1") })
+        assertTrue(renderer.snapshot().lines().any { it.contains("<< 1/2 >>") })
+
+        val info = privateField(view, "renderedInfo")
+        val rightArrowX = privateInt(info, "x") + 1 + "<< 1/2 >>".length - 2
+        val navY = privateInt(info, "y") + 1
+        view.dispatch(UIEvent(kind = "mouse_down", x = rightArrowX, y = navY, cols = 80, rows = 20))
+        view.render(renderer)
+        assertTrue(renderer.snapshot().lines().any { it.contains("<< 2/2 >>") })
+        val selectedInfo = privateField(view, "renderedInfo")
+        view.dispatch(UIEvent(
+            kind = "mouse_down",
+            x = privateInt(selectedInfo, "x") + 2,
+            y = privateInt(selectedInfo, "y") + 2,
+            cols = 80,
+            rows = 20
+        ))
+        assertEquals(listOf(second.toString()), opened)
+    }
+
+    @Test
+    fun usagePopupCapturesWheelAndKeyboardAndShowsAllReferencesThroughOffset() {
+        val root = Files.createTempDirectory("kode-usage-popup")
+        val refs = (0 until 12).map { index ->
+            NavigationTarget(root.resolve("use$index.c").toString(), range(index), name = "foo")
+        }
+        val service = PopupIntelligence(
+            tokens = listOf(Token(0, 3, listOf("codeintel.declaration"), 0, text = "foo")),
+            references = refs
+        )
+        val buffer = TextBuffer()
+        val opened = mutableListOf<String>()
+        val view = CodeEditorView(StyleSheet(), buffer, codeIntel = service,
+            navigationHandler = { path, _ -> opened += path })
+        view.loadVirtualContent("current.c", "foo\n" + (0 until 30).joinToString("\n") { "line $it" }, "c")
+        val renderer = StringSnapshotRenderer(cols = 80, rows = 12)
+        view.render(renderer)
+        val cursorBefore = buffer.cursorPosition()
+        view.dispatch(UIEvent(kind = "mouse_down", x = 3, y = 1, ctrl = true, cols = 80, rows = 12))
+        view.render(renderer)
+        val before = renderer.snapshot().toString()
+        assertTrue(before.contains("usage sites"))
+        assertTrue(before.contains("│") || before.contains("█"))
+        val usageBox = privateField(view, "renderedPopup")
+        view.dispatch(UIEvent(
+            kind = "mouse_move",
+            x = privateInt(usageBox, "x"),
+            y = privateInt(usageBox, "y") + 1,
+            cols = 80,
+            rows = 12
+        ))
+        assertEquals(-1, privateIntValue(view, "hoveredUsageIndex"), "row padding is not a link")
+        view.dispatch(UIEvent(kind = "mouse_move", x = 0, y = 0, cols = 80, rows = 12))
+        assertEquals(-1, privateIntValue(view, "hoveredUsageIndex"), "leaving the popup clears the link hover")
+        assertEquals(0, privateIntValue(view, "selectedUsageIndex"), "hovering does not change keyboard selection")
+        val tinyRenderer = StringSnapshotRenderer(cols = 10, rows = 4)
+        view.render(tinyRenderer)
+        assertTrue(tinyRenderer.snapshot().lines().all { it.length == 10 })
+        view.render(renderer)
+
+        assertTrue(view.dispatch(UIEvent(kind = "mouse_scroll", scrollDelta = -1)))
+        assertEquals(cursorBefore, buffer.cursorPosition())
+        assertEquals(1, privateIntValue(view, "usageScrollOffset"))
+        view.dispatch(UIEvent(kind = "key_down", key = "PageDown"))
+        view.dispatch(UIEvent(kind = "key_down", key = "End"))
+        assertEquals(cursorBefore, buffer.cursorPosition())
+        assertEquals(refs.lastIndex, privateIntValue(view, "selectedUsageIndex"))
+        view.render(renderer)
+        assertTrue(renderer.snapshot().lines().any { it.contains("use11.c:12") })
+        view.dispatch(UIEvent(kind = "key_down", key = "Enter"))
+        assertEquals(listOf(refs.last().filePath), opened)
+    }
+
+    @Test
+    fun outsideClickDismissesDefinitionBeforeNextAnimationFrame() {
+        val root = Files.createTempDirectory("kode-definition-dismiss")
+        val target = root.resolve("target.c").also { Files.writeString(it, "int foo(void) { return 1; }\n") }
+        val service = PopupIntelligence(definitions = listOf(NavigationTarget(target.toString(), range(0))))
+        val view = CodeEditorView(StyleSheet(), syntaxProvider = KeywordSyntaxProvider, codeIntel = service)
+        view.loadVirtualContent(root.resolve("current.c").toString(), "foo\n", "c")
+        val renderer = StringSnapshotRenderer(cols = 60, rows = 12)
+        view.render(renderer)
+        view.dispatch(UIEvent(kind = "mouse_move", x = 3, y = 1, timeMs = 0, cols = 60, rows = 12))
+        view.dispatch(UIEvent(kind = "mouse_move", x = 3, y = 1, timeMs = 600, cols = 60, rows = 12))
+        view.render(renderer)
+        assertTrue(renderer.snapshot().lines().any { it.contains("Definition") })
+        view.dispatch(UIEvent(kind = "mouse_down", x = 0, y = 1, cols = 60, rows = 12))
+        view.dispatch(UIEvent(kind = "animation_frame", timeMs = 2000, cols = 60, rows = 12))
+        view.render(renderer)
+        assertTrue(renderer.snapshot().lines().none { it.contains("Definition") })
+    }
+
+    @Test
     fun usagePathsCollapseDirectoriesAndPreserveFilename() {
         val view = CodeEditorView(StyleSheet())
         val method = CodeEditorView::class.java.getDeclaredMethod(
@@ -232,5 +360,31 @@ class CodeEditorViewTest {
         )
         method.isAccessible = true
         method.invoke(view, suggestion, prefix)
+    }
+
+    private fun range(line: Int): editor.codeintel.TextRange =
+        editor.codeintel.TextRange(TextPosition(line, 0), TextPosition(line, 3))
+
+    private fun privateField(view: CodeEditorView, name: String): Any {
+        return CodeEditorView::class.java.getDeclaredField(name).apply { isAccessible = true }.get(view)!!
+    }
+
+    private fun privateInt(value: Any, name: String): Int =
+        value.javaClass.getDeclaredField(name).apply { isAccessible = true }.getInt(value)
+
+    private fun privateIntValue(view: CodeEditorView, name: String): Int =
+        CodeEditorView::class.java.getDeclaredField(name).apply { isAccessible = true }.getInt(view)
+
+    private class PopupIntelligence(
+        private val tokens: List<Token> = listOf(Token(0, 3, listOf("codeintel.usage"), 0, text = "foo")),
+        private val definitions: List<NavigationTarget> = emptyList(),
+        private val references: List<NavigationTarget> = emptyList()
+    ) : EditorIntelligenceService {
+        override fun tokens(request: TokensRequest): List<Token> = tokens
+        override fun definitions(request: DefinitionRequest): List<NavigationTarget> = definitions
+        override fun references(request: ReferenceRequest): List<NavigationTarget> = references
+        override fun completions(request: editor.codeintel.CompletionRequest): List<CompletionItem> = emptyList()
+        override fun diagnostics(path: String): List<Diagnostic> = emptyList()
+        override fun documentSymbols(path: String): List<Symbol> = emptyList()
     }
 }

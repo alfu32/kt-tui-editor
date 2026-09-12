@@ -48,6 +48,8 @@ class CodeEditorView(
         private const val HOVER_INFO_DELAY_MS = 500L
         private const val MAX_DEFINITION_PREVIEW_LINES = 24
         private const val MAX_USAGE_PATH_LENGTH = 48
+        private const val MAX_USAGE_VISIBLE_ROWS = 8
+        private const val MAX_USAGE_POPUP_HEIGHT = 10
         private const val TAB_WIDTH = 4
     }
 
@@ -72,12 +74,19 @@ class CodeEditorView(
     private var lastIndexedVersion: Long = -1
     private var usagePopup: UsagePopup? = null
     private var renderedPopup: RenderedPopup? = null
+    private var usageScrollOffset: Int = 0
+    private var usageDragging = false
+    private var usageDragStartY = 0
+    private var usageDragStartOffset = 0
     private var suggestionPopup: SuggestionPopup? = null
     private var renderedSuggestion: RenderedPopup? = null
     private var infoPopup: InfoPopup? = null
     private var renderedInfo: RenderedPopup? = null
+    private var hoveredDefinitionControl: DefinitionControl? = null
+    private var hoveredDefinitionArrow: Arrow? = null
     private var hoverInfoCandidate: HoverInfoCandidate? = null
     private var hoveredUsageIndex: Int = -1
+    private var selectedUsageIndex: Int = -1
     private var hoveredSuggestionIndex: Int = -1
     private var hoveredUsage: HoveredUsage? = null
     private var rerenderOnce: Boolean = false
@@ -497,6 +506,11 @@ class CodeEditorView(
         val bodyRows = (rows - 1 - searchHeight).coerceAtLeast(0)
         val bodyStartRow = 1 + searchHeight
 
+        // Popups own mouse input while open.  In particular, moving from the
+        // source token into a popup must not be interpreted as editor input.
+        if (event.kind.startsWith("mouse") && handlePopupMouse(event)) return true
+        if (event.kind == "key_down" && handlePopupKeys(event.key)) return true
+
         if (event.kind == "key_down" && event.ctrl && event.key?.lowercase() == "f") {
             val selection = if (buffer.hasSelection()) buffer.selectionText() else ""
             openSearch(selection)
@@ -660,7 +674,6 @@ class CodeEditorView(
                     ensureCursorVisible(rows, searchHeight, layout, gutterWidth)
                     return true
                 }
-                if (handlePopupKeys(key)) return true
                 if (event.ctrl && (key == " " || key == "space")) {
                     openSuggestions()
                     return true
@@ -727,10 +740,11 @@ class CodeEditorView(
         renderedPopup = null
         suggestionPopup = null
         renderedSuggestion = null
+        infoPopup = null
+        renderedInfo = null
+        hoverInfoCandidate = null
 
         val name = token.text
-        openDefinition(name, Position(line, col))
-
         val isDeclaration = token.scopes.any { it.contains("codeintel.declaration") }
         if (isDeclaration) {
             val refs = codeIntel?.references(
@@ -741,6 +755,7 @@ class CodeEditorView(
                     symbol = name
                 )
             ).orEmpty()
+            val sourceCache = mutableMapOf<String, List<String>>()
             val usageEntries = refs.map {
                 if (it.filePath.isBlank()) {
                     UsageEntry("", -1, -1, it.name ?: "")
@@ -749,15 +764,20 @@ class CodeEditorView(
                         filePath = it.filePath,
                         line = it.range.start.line,
                         column = it.range.start.column,
-                        identifier = name
+                        identifier = name,
+                        sourceCache = sourceCache
                     )
                     UsageEntry(it.filePath, it.range.start.line, it.range.start.column, label)
                 }
             }
             if (usageEntries.isNotEmpty()) {
                 usagePopup = UsagePopup(Position(line, col), usageEntries)
-                hoveredUsageIndex = 0
+                usageScrollOffset = 0
+                hoveredUsageIndex = -1
+                selectedUsageIndex = 0
             }
+        } else {
+            openDefinition(name, Position(line, col))
         }
         return true
     }
@@ -827,8 +847,10 @@ class CodeEditorView(
         val ex = event.x ?: return false
         val ey = event.y ?: return false
         if (ex !in rp.x until (rp.x + rp.width) || ey !in rp.y until (rp.y + rp.height)) return false
-        val idx = ey - rp.y - 1
+        val rel = ey - rp.y
+        val idx = if (rel in 1..usageVisibleCount(rp)) usageScrollOffset + rel - 1 else -1
         if (idx !in popup.entries.indices) return true
+        selectedUsageIndex = idx
         val entry = popup.entries[idx]
         if (entry.file.isNotBlank()) {
             navigationHandler?.invoke(entry.file, Position(entry.line, entry.column))
@@ -919,6 +941,162 @@ class CodeEditorView(
         return beforePrefix.endsWith('.')
     }
 
+    private fun handlePopupMouse(event: UIEvent): Boolean {
+        if (event.kind == "mouse_scroll" && usagePopup != null) {
+            val popup = usagePopup ?: return true
+            val visible = renderedPopup?.let(::usageVisibleCount) ?: MAX_USAGE_VISIBLE_ROWS
+            usageScrollOffset = (usageScrollOffset - (event.scrollDelta ?: 0)).coerceIn(
+                0, (popup.entries.size - visible).coerceAtLeast(0)
+            )
+            hoveredUsageIndex = -1
+            clampUsageSelectionToVisible(visible)
+            return true
+        }
+        val ex = event.x ?: return false
+        val ey = event.y ?: return false
+        val usageBox = renderedPopup
+        val infoBox = renderedInfo
+        val suggestionBox = renderedSuggestion
+        fun inside(box: RenderedPopup?): Boolean =
+            box != null && ex in box.x until (box.x + box.width) && ey in box.y until (box.y + box.height)
+
+        if (event.kind == "mouse_scroll" && infoPopup != null) {
+            if (inside(infoBox)) return true
+            infoPopup = null
+            renderedInfo = null
+            hoverInfoCandidate = null
+            hoveredDefinitionControl = null
+            hoveredDefinitionArrow = null
+            return false
+        }
+
+        if (event.kind == "mouse_move" && usageDragging && usageBox != null) {
+            val popup = usagePopup ?: return true
+            val visible = usageVisibleCount(usageBox)
+            val maxOffset = (popup.entries.size - visible).coerceAtLeast(0)
+            val trackHeight = visible.coerceAtLeast(1)
+            val delta = (ey - usageDragStartY) * maxOffset / (trackHeight - 1).coerceAtLeast(1)
+            usageScrollOffset = (usageDragStartOffset + delta).coerceIn(0, maxOffset)
+            hoveredUsageIndex = -1
+            clampUsageSelectionToVisible(visible)
+            return true
+        }
+        if (event.kind == "mouse_move" && inside(usageBox)) {
+            updatePopupHover(event)
+            return true
+        }
+        if (event.kind == "mouse_move" && usagePopup != null) {
+            hoveredUsageIndex = -1
+            return true
+        }
+        if (event.kind == "mouse_move" && inside(infoBox)) {
+            updatePopupHover(event)
+            return true
+        }
+        if (event.kind == "mouse_move" && inside(suggestionBox)) {
+            updatePopupHover(event)
+            return true
+        }
+        if (event.kind == "mouse_down") {
+            if (inside(usageBox)) {
+                if (ex == usageBox!!.x + usageBox.width - 1) {
+                    val rel = ey - usageBox.y
+                    val visible = usageVisibleCount(usageBox)
+                    if (rel in 1..visible) {
+                        handleUsageScrollbarClick(event)
+                        usageDragging = true
+                        usageDragStartY = ey
+                        // Track clicks reposition immediately; drag deltas start
+                        // from that new position rather than the old offset.
+                        usageDragStartOffset = usageScrollOffset
+                    }
+                    return true
+                }
+                return handleUsageClick(event)
+            }
+            if (inside(infoBox)) return handleInfoClick(event)
+            if (inside(suggestionBox)) return handleSuggestionClick(event)
+            if (usagePopup != null || infoPopup != null || suggestionPopup != null) {
+                usagePopup = null
+                renderedPopup = null
+                infoPopup = null
+                renderedInfo = null
+                suggestionPopup = null
+                renderedSuggestion = null
+                hoverInfoCandidate = null
+                hoveredDefinitionControl = null
+                hoveredDefinitionArrow = null
+                selectedUsageIndex = -1
+                return true
+            }
+        }
+        if (event.kind == "mouse_up" && usageDragging) {
+            usageDragging = false
+            return true
+        }
+        if (event.kind == "mouse_up" && (inside(usageBox) || inside(infoBox) || inside(suggestionBox))) return true
+        return false
+    }
+
+    private fun usageVisibleCount(box: RenderedPopup): Int = (box.height - 2).coerceAtLeast(0)
+
+    private fun clampUsageSelectionToVisible(visible: Int) {
+        val popup = usagePopup ?: return
+        if (popup.entries.isEmpty() || visible <= 0) return
+        selectedUsageIndex = selectedUsageIndex.coerceIn(
+            usageScrollOffset,
+            minOf(popup.entries.lastIndex, usageScrollOffset + visible - 1)
+        )
+    }
+
+    private fun handleUsageScrollbarClick(event: UIEvent): Boolean {
+        val box = renderedPopup ?: return false
+        val popup = usagePopup ?: return false
+        if (event.x != box.x + box.width - 1) return false
+        val visible = usageVisibleCount(box)
+        val maxOffset = (popup.entries.size - visible).coerceAtLeast(0)
+        if (maxOffset == 0) return true
+        val trackHeight = visible.coerceAtLeast(1)
+        val pos = ((event.y ?: box.y) - box.y - 1).coerceIn(0, trackHeight - 1)
+        usageScrollOffset = (pos * maxOffset / (trackHeight - 1).coerceAtLeast(1)).coerceIn(0, maxOffset)
+        clampUsageSelectionToVisible(visible)
+        return true
+    }
+
+    private fun handleInfoClick(event: UIEvent): Boolean {
+        val box = renderedInfo ?: return false
+        val popup = infoPopup ?: return false
+        val y = (event.y ?: return true) - box.y
+        if (y == 1 && popup.targets.size > 1) {
+            val nav = "<< ${popup.selectedIndex + 1}/${popup.targets.size} >>"
+            val navStart = box.x + 1
+            val x = event.x ?: box.x
+            val left = navStart until (navStart + 2)
+            val rightStart = navStart + nav.length - 2
+            val right = rightStart until (rightStart + 2)
+            if (x in left) popup.selectedIndex = (popup.selectedIndex - 1).coerceAtLeast(0)
+            if (x in right) popup.selectedIndex = (popup.selectedIndex + 1).coerceAtMost(popup.targets.lastIndex)
+            return true
+        }
+        if (y == 2) {
+            val location = popup.targets.getOrNull(popup.selectedIndex)?.let {
+                "${relativePath(it.target.filePath)}:${it.target.range.start.line + 1}"
+            }.orEmpty()
+            val locationStart = box.x + 1
+            val locationEnd = locationStart + location.length
+            if ((event.x ?: box.x) !in locationStart until locationEnd) return true
+            val target = popup.targets.getOrNull(popup.selectedIndex)?.target
+            if (target != null) {
+                navigationHandler?.invoke(target.filePath, Position(target.range.start.line, target.range.start.column))
+                infoPopup = null
+                renderedInfo = null
+                hoverInfoCandidate = null
+            }
+            return true
+        }
+        return true
+    }
+
     private fun updatePopupHover(event: UIEvent): Boolean {
         val ex = event.x ?: return false
         val ey = event.y ?: return false
@@ -926,7 +1104,19 @@ class CodeEditorView(
         val sp = renderedSuggestion
         var consumed = false
         if (rp != null && ey in rp.y until (rp.y + rp.height) && ex in rp.x until (rp.x + rp.width)) {
-            hoveredUsageIndex = (ey - rp.y - 1).coerceIn(0, (usagePopup?.entries?.lastIndex ?: -1))
+            val rel = ey - rp.y
+            val visible = usageVisibleCount(rp)
+            val popup = usagePopup
+            val rowIndex = if (rel in 1..visible) usageScrollOffset + rel - 1 else -1
+            val entry = popup?.entries?.getOrNull(rowIndex)
+            val needsScrollbar = popup != null && popup.entries.size > visible
+            val selected = rowIndex == selectedUsageIndex
+            val textWidth = (rp.width - (if (needsScrollbar) 3 else 2) - (if (selected) 1 else 0)).coerceAtLeast(0)
+            val textStart = rp.x + if (selected) 2 else 1
+            hoveredUsageIndex = if (
+                entry != null && entry.file.isNotBlank() && textWidth > 0 &&
+                ex in textStart until (textStart + entry.label.length.coerceAtMost(textWidth))
+            ) rowIndex else -1
             consumed = true
         } else {
             hoveredUsageIndex = -1
@@ -936,6 +1126,35 @@ class CodeEditorView(
             consumed = true
         } else {
             hoveredSuggestionIndex = -1
+        }
+        val ip = renderedInfo
+        if (ip != null && ey in ip.y until (ip.y + ip.height) && ex in ip.x until (ip.x + ip.width)) {
+            val relY = ey - ip.y
+            val popup = infoPopup
+            val nav = popup?.let { "<< ${it.selectedIndex + 1}/${it.targets.size} >>" }.orEmpty()
+            val navStart = ip.x + 1
+            val location = popup?.targets?.getOrNull(popup.selectedIndex)?.let {
+                "${relativePath(it.target.filePath)}:${it.target.range.start.line + 1}"
+            }.orEmpty()
+            val leftHit = ex in navStart until (navStart + 2)
+            val rightHit = ex in (navStart + nav.length - 2) until (navStart + nav.length)
+            hoveredDefinitionControl = when {
+                relY == 1 && popup != null && popup.targets.size > 1 &&
+                    (leftHit || rightHit) ->
+                    DefinitionControl.NAVIGATION
+                relY == 2 && ex in navStart until (navStart + location.length) -> DefinitionControl.LOCATION
+                else -> null
+            }
+            hoveredDefinitionArrow = when {
+                hoveredDefinitionControl != DefinitionControl.NAVIGATION -> null
+                leftHit -> Arrow.LEFT
+                rightHit -> Arrow.RIGHT
+                else -> null
+            }
+            consumed = true
+        } else {
+            hoveredDefinitionControl = null
+            hoveredDefinitionArrow = null
         }
         return consumed
     }
@@ -1015,17 +1234,29 @@ class CodeEditorView(
                 symbol = candidate.name
             )
         ).orEmpty()
-        val def = defs.firstOrNull()
-        val definitionPreview = def?.let(::loadDefinitionPreview)
-        // Hover is a source-definition preview, not a dump of index metadata.
-        // Keep the technical fields available to navigation internally, but do
-        // not expose them in the editor popup.
-        if (definitionPreview == null) return null
-        return InfoPopup(candidate.anchor, emptyList(), definitionPreview)
+        val distinct = defs.distinctBy { target ->
+            listOf(
+                File(target.filePath).absoluteFile.normalize().toString(),
+                target.range.start.line,
+                target.range.start.column,
+                target.range.end.line,
+                target.range.end.column
+            )
+        }
+        if (distinct.isEmpty()) return null
+        return InfoPopup(
+            anchor = candidate.anchor,
+            targets = distinct.map { DefinitionTarget(it, loadDefinitionPreview(it)) }
+        )
     }
 
     private fun loadDefinitionPreview(target: NavigationTarget): DefinitionPreview? {
-        val source = runCatching { Files.readString(Paths.get(target.filePath)) }.getOrNull() ?: return null
+        val sameFile = runCatching {
+            Paths.get(target.filePath).toAbsolutePath().normalize() == Paths.get(filePath).toAbsolutePath().normalize()
+        }.getOrDefault(false)
+        val source = if (sameFile) buffer.text() else {
+            runCatching { Files.readString(Paths.get(target.filePath)) }.getOrNull()
+        } ?: return null
         // Legacy providers only report the identifier span. Expand that fallback
         // to the complete declaration line so hover remains useful for languages
         // without a semantic adapter yet.
@@ -1050,7 +1281,7 @@ class CodeEditorView(
     }
 
     private fun maybeShowHoverInfo(now: Long): Boolean {
-        if (infoPopup != null) return false
+        if (infoPopup != null || usagePopup != null) return false
         val candidate = hoverInfoCandidate ?: return false
         if (now - candidate.startedAt < HOVER_INFO_DELAY_MS) return false
         val popup = buildInfoPopup(candidate) ?: return false
@@ -1066,15 +1297,18 @@ class CodeEditorView(
 
     private fun handlePopupKeys(key: String?): Boolean {
         val k = key?.lowercase() ?: return false
-        val hasUsage = usagePopup != null && renderedPopup != null
+        val hasUsage = usagePopup != null
         val hasSuggestion = suggestionPopup != null && renderedSuggestion != null
-        if (!hasUsage && !hasSuggestion) return false
+        val hasInfo = infoPopup != null
+        if (!hasUsage && !hasSuggestion && !hasInfo) return false
+        if (hasInfo && !hasUsage && !hasSuggestion && k != "escape") return false
 
         fun clampUsage(delta: Int) {
             val popup = usagePopup ?: return
             val max = popup.entries.lastIndex
             if (max < 0) return
-            hoveredUsageIndex = (if (hoveredUsageIndex < 0) 0 else hoveredUsageIndex + delta).coerceIn(0, max)
+            selectedUsageIndex = (if (selectedUsageIndex < 0) 0 else selectedUsageIndex + delta).coerceIn(0, max)
+            hoveredUsageIndex = -1
         }
 
         fun clampSuggestion(delta: Int) {
@@ -1090,25 +1324,38 @@ class CodeEditorView(
                 renderedPopup = null
                 suggestionPopup = null
                 renderedSuggestion = null
+                infoPopup = null
+                renderedInfo = null
+                hoverInfoCandidate = null
                 hoveredUsageIndex = -1
                 hoveredSuggestionIndex = -1
+                selectedUsageIndex = -1
+                hoveredDefinitionControl = null
+                hoveredDefinitionArrow = null
                 return true
             }
             "up" -> {
-                if (hasUsage) clampUsage(-1)
+                if (hasUsage) {
+                    clampUsage(-1)
+                    usageScrollOffset = usageScrollOffset.coerceAtMost(selectedUsageIndex)
+                }
                 if (hasSuggestion) clampSuggestion(-1)
                 return true
             }
             "down" -> {
-                if (hasUsage) clampUsage(1)
+                if (hasUsage) {
+                    clampUsage(1)
+                    val visible = renderedPopup?.let(::usageVisibleCount) ?: MAX_USAGE_VISIBLE_ROWS
+                    if (selectedUsageIndex >= usageScrollOffset + visible) usageScrollOffset = selectedUsageIndex - visible + 1
+                }
                 if (hasSuggestion) clampSuggestion(1)
                 return true
             }
             "enter", "return" -> {
-                if (hasUsage && hoveredUsageIndex >= 0) {
+                if (hasUsage && selectedUsageIndex >= 0) {
                     val popup = usagePopup
-                    if (popup != null && hoveredUsageIndex in popup.entries.indices) {
-                        val entry = popup.entries[hoveredUsageIndex]
+                    if (popup != null && selectedUsageIndex in popup.entries.indices) {
+                        val entry = popup.entries[selectedUsageIndex]
                         if (entry.file.isNotBlank()) {
                             navigationHandler?.invoke(entry.file, Position(entry.line, entry.column))
                         }
@@ -1128,7 +1375,43 @@ class CodeEditorView(
                     }
                 }
             }
+            "pageup" -> {
+                if (hasUsage) {
+                    val visible = renderedPopup?.let(::usageVisibleCount) ?: MAX_USAGE_VISIBLE_ROWS
+                    clampUsage(-visible)
+                    usageScrollOffset = (usageScrollOffset - visible).coerceAtLeast(0)
+                    return true
+                }
+            }
+            "pagedown" -> {
+                if (hasUsage) {
+                    val visible = renderedPopup?.let(::usageVisibleCount) ?: MAX_USAGE_VISIBLE_ROWS
+                    clampUsage(visible)
+                    val maxOffset = ((usagePopup?.entries?.size ?: 0) - visible).coerceAtLeast(0)
+                    usageScrollOffset = (usageScrollOffset + visible).coerceAtMost(maxOffset)
+                    return true
+                }
+            }
+            "home" -> {
+                if (hasUsage) {
+                    selectedUsageIndex = 0
+                    hoveredUsageIndex = -1
+                    usageScrollOffset = 0
+                    return true
+                }
+            }
+            "end" -> {
+                if (hasUsage) {
+                    val last = usagePopup?.entries?.lastIndex ?: 0
+                    selectedUsageIndex = last
+                    hoveredUsageIndex = -1
+                    val visible = renderedPopup?.let(::usageVisibleCount) ?: MAX_USAGE_VISIBLE_ROWS
+                    usageScrollOffset = (last - visible + 1).coerceAtLeast(0)
+                    return true
+                }
+            }
         }
+        if (hasUsage) return true
         return false
     }
 
@@ -1711,25 +1994,62 @@ class CodeEditorView(
         val anchorRow = visualRowForPosition(popup.anchor, layout)
         val screenRow = bodyStartRow + (anchorRow - scrollTop)
         val x = (gutterWidth + visualColumnAt(popup.anchor, layout)).coerceAtLeast(gutterWidth)
-        val maxLabel = popup.entries.take(10).maxOfOrNull { it.label.length } ?: 0
-        val width = (maxLabel + 2).coerceAtMost((cols - x).coerceAtLeast(12))
-        val height = (popup.entries.size + 1).coerceAtMost((rows - screenRow - 1).coerceAtLeast(2))
-        if (height < 2) {
+        val maxLabel = popup.entries.maxOfOrNull { it.label.length } ?: 0
+        val height = minOf(MAX_USAGE_POPUP_HEIGHT, rows - bodyStartRow, popup.entries.size + 2)
+        if (height < 3) {
             renderedPopup = null
             return
         }
+        val visible = usageVisibleCount(RenderedPopup(0, 0, 1, height))
+        val needsScrollbar = popup.entries.size > visible
+        val width = (maxLabel + 2 + if (needsScrollbar) 1 else 0)
+            .coerceAtMost(cols.coerceAtLeast(1))
+            .coerceAtLeast(1)
         val finalX = x.coerceIn(0, (cols - width).coerceAtLeast(0))
-        val finalY = screenRow.coerceIn(bodyStartRow, (rows - height).coerceAtLeast(bodyStartRow))
+        val maxY = (rows - height).coerceAtLeast(bodyStartRow)
+        val finalY = if (screenRow + height <= rows) {
+            screenRow.coerceIn(bodyStartRow, maxY)
+        } else {
+            (screenRow - height).coerceIn(bodyStartRow, maxY)
+        }
         val style = localStyleSheet.getStyle("code-search-bar").withDefaults()
-        val hoverStyle = localStyleSheet.getStyle("code-search-active").withDefaults(style.fg, style.bg)
+        val titleStyle = localStyleSheet.getStyle("definition-title").withDefaults(style.fg, style.bg)
+        val delimiterStyle = localStyleSheet.getStyle("definition-delimiter").withDefaults(style.fg, style.bg)
+        val scrollbarStyle = localStyleSheet.getStyle("code-popup-scrollbar").withDefaults(style.fg, style.bg)
+        val linkStyle = style.copy().also { it.textDecoration = "underline" }
+        usageScrollOffset = usageScrollOffset.coerceIn(0, (popup.entries.size - visible).coerceAtLeast(0))
+        clampUsageSelectionToVisible(visible)
         canvas.withStyle(style) {
             drawRect(finalX, finalY, width, height)
-            val entries = popup.entries.take(height - 1)
+            canvas.withStyle(titleStyle) {
+                drawText(finalX, finalY, "usage sites".take(width).padEnd(width, ' '))
+            }
+            val entries = popup.entries.drop(usageScrollOffset).take(visible)
             entries.forEachIndexed { idx, entry ->
-                val text = entry.label.take(width - 2).padEnd(width - 2, ' ')
-                val rowStyle = if (idx == hoveredUsageIndex) hoverStyle else style
-                canvas.withStyle(rowStyle) {
-                    drawText(finalX + 1, finalY + idx + 1, text)
+                val selected = usageScrollOffset + idx == selectedUsageIndex
+                val textWidth = (width - (if (needsScrollbar) 3 else 2) - (if (selected) 1 else 0)).coerceAtLeast(0)
+                val text = entry.label.take(textWidth).padEnd(textWidth, ' ')
+                val textX = finalX + if (selected) 2 else 1
+                if (selected && finalX + 1 < cols) drawText(finalX + 1, finalY + idx + 1, ">")
+                if (textWidth > 0) drawText(textX, finalY + idx + 1, text)
+                if (usageScrollOffset + idx == hoveredUsageIndex) {
+                    if (textWidth > 0) canvas.withStyle(linkStyle) {
+                        drawText(textX, finalY + idx + 1, entry.label.take(textWidth))
+                    }
+                }
+            }
+            canvas.withStyle(delimiterStyle) {
+                drawText(finalX, finalY + height - 1, " ".repeat(width))
+            }
+            if (needsScrollbar) {
+                val trackHeight = visible.coerceAtLeast(1)
+                val maxOffset = (popup.entries.size - visible).coerceAtLeast(1)
+                val indicatorRow = usageScrollOffset * (trackHeight - 1) / maxOffset
+                val scrollbarX = finalX + width - 1
+                canvas.withStyle(scrollbarStyle) {
+                    (0 until trackHeight).forEach { row ->
+                        drawText(scrollbarX, finalY + row + 1, if (row == indicatorRow) "█" else "│")
+                    }
                 }
             }
         }
@@ -1794,25 +2114,65 @@ class CodeEditorView(
         }
         val anchorRow = visualRowForPosition(popup.anchor, layout)
         val screenRow = bodyStartRow + (anchorRow - scrollTop)
-        val preview = popup.definition
+        val selected = popup.targets.getOrNull(popup.selectedIndex)
+        val preview = selected?.preview
+        val location = selected?.target?.let { "${relativePath(it.filePath)}:${it.range.start.line + 1}" } ?: "source unavailable"
+        val nav = "<< ${popup.selectedIndex + 1}/${popup.targets.size} >>"
         val maxLabel = maxOf(
-            popup.entries.maxOfOrNull { "${it.first}: ${it.second}".length } ?: 0,
+            location.length,
+            nav.length,
             preview?.lines?.maxOfOrNull(String::length) ?: 0,
-            if (preview != null) "definition:".length else 0
+            if (preview == null) "source unavailable".length else 0
         )
-        val width = (maxLabel + 2).coerceAtMost((cols - gutterWidth).coerceAtLeast(16))
-        val contentRows = popup.entries.size + (preview?.let { it.lines.size + 1 } ?: 0)
-        val height = (contentRows + 1).coerceAtMost(rows.coerceAtLeast(2))
+        val width = (maxLabel + 2).coerceAtMost((cols - gutterWidth).coerceAtLeast(1)).coerceAtLeast(1)
+        val contentRows = 3 + (preview?.lines?.size ?: 1)
+        val height = (contentRows + 1).coerceAtMost((rows - bodyStartRow).coerceAtLeast(2))
+        if (height < 4) {
+            renderedInfo = null
+            return
+        }
         val x = (gutterWidth + visualColumnAt(popup.anchor, layout)).coerceIn(0, (cols - width).coerceAtLeast(0))
         var finalY = (screenRow - height).coerceAtLeast(bodyStartRow)
         if (finalY + height > rows) finalY = (rows - height).coerceAtLeast(bodyStartRow)
         val style = localStyleSheet.getStyle("code-search-bar").withDefaults()
+        val titleStyle = localStyleSheet.getStyle("definition-title").withDefaults(style.fg, style.bg)
+        val delimiterStyle = localStyleSheet.getStyle("definition-delimiter").withDefaults(style.fg, style.bg)
+        val linkStyle = style.copy().also { it.textDecoration = "underline" }
         canvas.withStyle(style) {
             drawRect(x, finalY, width, height)
+            canvas.withStyle(titleStyle) {
+                drawText(x, finalY, "Definition".take(width).padEnd(width, ' '))
+            }
             var row = 1
-            if (preview != null && row < height) {
-                drawText(x + 1, finalY + row, "definition:".take(width - 2).padEnd(width - 2, ' '))
-                row++
+            val innerWidth = (width - 2).coerceAtLeast(0)
+            val navText = nav.take(innerWidth).padEnd(innerWidth, ' ')
+            if (innerWidth > 0) drawText(x + 1, finalY + row, navText)
+            if (innerWidth > 0 && popup.targets.size > 1 && hoveredDefinitionControl == DefinitionControl.NAVIGATION) {
+                canvas.withStyle(linkStyle) {
+                    if (hoveredDefinitionControl == DefinitionControl.NAVIGATION) {
+                        // Underline only the arrow glyph under the pointer;
+                        // the count and padding remain ordinary popup text.
+                        val pointer = hoveredDefinitionArrow
+                        if (pointer == Arrow.LEFT) drawText(x + 1, finalY + row, "<<".take(innerWidth))
+                        if (pointer == Arrow.RIGHT) {
+                            val rightOffset = nav.length - 2
+                            if (rightOffset < innerWidth) {
+                                drawText(x + 1 + rightOffset, finalY + row, ">>".take(innerWidth - rightOffset))
+                            }
+                        }
+                    }
+                }
+            }
+            row++
+            val locationText = location.take(innerWidth)
+            if (row < height - 1 && innerWidth > 0) {
+                drawText(x + 1, finalY + row, locationText.padEnd(innerWidth, ' '))
+            }
+            if (hoveredDefinitionControl == DefinitionControl.LOCATION && row < height - 1 && innerWidth > 0) {
+                canvas.withStyle(linkStyle) { drawText(x + 1, finalY + row, locationText) }
+            }
+            row++
+            if (preview != null) {
                 val previewSyntax = if (syntaxProvider != null && !preview.language.isNullOrBlank()) {
                     syntaxProvider.tokensForLines(preview.startLine, preview.lines, preview.language!!).groupBy { it.line }
                 } else {
@@ -1865,20 +2225,25 @@ class CodeEditorView(
                     )
                     row++
                 }
+            } else if (row < height - 1 && innerWidth > 0) {
+                drawText(x + 1, finalY + row, "source unavailable".take(innerWidth).padEnd(innerWidth, ' '))
             }
-            popup.entries.forEach { entry ->
-                if (row >= height) return@forEach
-                val text = "${entry.first}: ${entry.second}".take(width - 2).padEnd(width - 2, ' ')
-                drawText(x + 1, finalY + row, text)
-                row++
+            canvas.withStyle(delimiterStyle) {
+                drawText(x, finalY + height - 1, " ".repeat(width))
             }
         }
         renderedInfo = RenderedPopup(x, finalY, width, height)
     }
 
-    private fun buildUsageLabel(filePath: String, line: Int, column: Int, identifier: String): String {
+    private fun buildUsageLabel(
+        filePath: String,
+        line: Int,
+        column: Int,
+        identifier: String,
+        sourceCache: MutableMap<String, List<String>> = mutableMapOf()
+    ): String {
         val relPath = compactPath(relativePath(filePath))
-        val lineText = readLineText(filePath, line)
+        val lineText = readLineText(filePath, line, sourceCache)
         val snippet = snippetAround(lineText, column, identifier.length)
         return "$relPath:${line + 1}:${column + 1} | $snippet"
     }
@@ -1923,19 +2288,20 @@ class CodeEditorView(
         return normalized.take((maxLength - 1).coerceAtLeast(1)) + "…"
     }
 
-    private fun readLineText(filePath: String, line: Int): String {
-        return runCatching {
-            Files.newBufferedReader(Paths.get(filePath)).use { reader ->
-                var current = 0
-                var text: String? = reader.readLine()
-                while (text != null) {
-                    if (current == line) return text
-                    current++
-                    text = reader.readLine()
-                }
-                ""
+    private fun readLineText(filePath: String, line: Int, sourceCache: MutableMap<String, List<String>>): String {
+        if (line < 0) return ""
+        val sameFile = runCatching {
+            Paths.get(filePath).toAbsolutePath().normalize() == Paths.get(this.filePath).toAbsolutePath().normalize()
+        }.getOrDefault(false)
+        val cacheKey = if (sameFile) "@current-buffer" else filePath
+        val lines = sourceCache.getOrPut(cacheKey) {
+            if (sameFile) {
+                buffer.text().split('\n')
+            } else {
+            runCatching { Files.readString(Paths.get(filePath)).split('\n') }.getOrDefault(emptyList())
             }
-        }.getOrDefault("")
+        }
+        return lines.getOrElse(line) { "" }
     }
 
     private fun snippetAround(lineText: String, column: Int, length: Int): String {
@@ -2013,6 +2379,8 @@ class CodeEditorView(
     private data class UsageEntry(val file: String, val line: Int, val column: Int, val label: String)
     private data class UsagePopup(val anchor: Position, val entries: List<UsageEntry>)
     private data class RenderedPopup(val x: Int, val y: Int, val width: Int, val height: Int)
+    private enum class DefinitionControl { NAVIGATION, LOCATION }
+    private enum class Arrow { LEFT, RIGHT }
     private data class SuggestionEntry(val name: String, val detail: String?)
     private data class SuggestionPopup(val anchor: Position, val prefix: String, val entries: List<SuggestionEntry>)
     private data class HoverInfoCandidate(val key: Triple<Int, Int, Int>, val name: String, val startedAt: Long, val anchor: Position)
@@ -2023,9 +2391,10 @@ class CodeEditorView(
         val startLine: Int,
         val lines: List<String>
     )
+    private data class DefinitionTarget(val target: NavigationTarget, val preview: DefinitionPreview?)
     private data class InfoPopup(
         val anchor: Position,
-        val entries: List<Pair<String, String>>,
-        val definition: DefinitionPreview? = null
+        val targets: List<DefinitionTarget>,
+        var selectedIndex: Int = 0
     )
 }
